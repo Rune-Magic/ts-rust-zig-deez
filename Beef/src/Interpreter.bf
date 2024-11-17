@@ -9,7 +9,7 @@ public enum MonkeyValue : IHashable, IRefCounted
 	case Int(int), Bool(bool);
 	case String(RefCounted<String>);
 	case Array(RefCounted<MonkeyValue[]>);
-	case Function(FunctionExpression, Dictionary<StringView, MonkeyValue> captures, bool capturesLocked);
+	case Function(FunctionExpression, Dictionary<StringView, MonkeyValue> captures, bool* capturesLocked);
 	case Dict(RefCounted<Dictionary<MonkeyValue, MonkeyValue>>);
 
 	public static operator Self(int val) => .Int(val);
@@ -78,7 +78,7 @@ public enum MonkeyValue : IHashable, IRefCounted
 	[Commutable]
 	public static bool operator== (Self lhs, Self rhs)
 	{
-		if (lhs case rhs) return true;
+		if (lhs === rhs) return true;
 		if (lhs case .String(let p0) && rhs case .String(let p1))
 		{
 			return StringView(p0) == StringView(p1);
@@ -153,9 +153,23 @@ public enum MonkeyValue : IHashable, IRefCounted
 	{
 		switch (this)
 		{
-		case .String(IRefCounted val), .Dict(out val), .Array(out val):
+		case .String(let val):
 			val.AddRef();
-		case .Int, .Bool, .Function:
+		case .Array(let val):
+			for (let item in val.Value)
+				item.AddRef();
+			val.AddRef();
+		case .Dict(let val):
+			for (let kv in val.Value)
+			{
+				kv.key.AddRef();
+				kv.value.AddRef();
+			}
+			val.AddRef();
+		case .Function(?, let captures, ?):
+			for (let capture in captures)
+				capture.value.AddRef();
+		case .Int, .Bool:
 		}
 	}
 
@@ -163,9 +177,23 @@ public enum MonkeyValue : IHashable, IRefCounted
 	{
 		switch (this)
 		{
-		case .String(IRefCounted val), .Dict(out val), .Array(out val):
+		case .String(let val):
 			val.Release();
-		case .Int, .Bool, .Function:
+		case .Array(let val):
+			for (let item in val.Value)
+				item.Release();
+			val.Release();
+		case .Dict(let val):
+			for (let kv in val.Value)
+			{
+				kv.key.Release();
+				kv.value.Release();
+			}
+			val.Release();
+		case .Function(?, let captures, ?):
+			for (let capture in captures)
+				capture.value.Release();
+		case .Int, .Bool:
 		}
 	}
 }
@@ -195,18 +223,18 @@ class Interpreter
 
 	//protected Parser parser;
 	public IErrorOutput output;
-	protected IRawAllocator alloc;
+	protected BumpAllocator alloc;
 	protected Queue<Scope> scopes = new .(4) ~ delete _;
 	protected Dictionary<Variable, MonkeyValue> variables = new .(32) ~ delete _;
 	protected Queue<(SourceIndex idx, String name)> stackTrace = new .(4) ~ delete _;
-	protected Queue<HashSet<Variable>> scopedVariables = new .(4) ~ delete _;
+	protected Queue<Queue<MonkeyValue>> scopedValues = new .(4) ~ delete _;
 
 	public this(Parser parser)
 	{
 		alloc = parser.Source.alloc;
 		output = parser.Source.output;
 		output.StackTrace = stackTrace;
-		stackTrace.Add((parser.Source.index, new:alloc .(parser.Source.origin)));
+		stackTrace.AddFront((parser.Source.index, new:alloc .(parser.Source.origin)));
 	}
 
 	public ~this()
@@ -216,38 +244,38 @@ class Interpreter
 
 	public Result<void> ScopeIn(ScopeType type = .Block, SourceIndex idx = default)
 	{
-		scopes.Add(new:alloc .(type, new:alloc .()));
-		scopedVariables.Add(new .());
+		scopes.AddFront(new:alloc .(type, new:alloc .()));
+		scopedValues.Add(new .(5));
 		if (type case .Function(let definition, let callee))
 		{
 			String name = new .(32);
 			definition.ToValueString(name);
 			name.Insert("function ".[ConstEval]Length, callee);
-			stackTrace.Add((idx, name));
+			stackTrace.AddFront((idx, name));
 		}
 		return .Ok;
 	}
 
 	public Result<void> ScopeOut()
 	{
-		let scop = scopes.Back;
-		for (var f in ref scop.funcs)
+		let scop = scopes.Front;
+		for (let f in scop.funcs)
 		{
-			Runtime.Assert(f case .Function(let func, let captures, var ref capturesLocked));
-			capturesLocked = true;
+			Runtime.Assert(f case .Function(let func, let captures, let capturesLocked));
+			*capturesLocked = true;
 			for (let capture in func.captures)
-				captures.Add(capture, Try!(GetVarValue(capture, func.fnToken.position))..AddRef());
+				captures.Add(capture, .CreateCopy(Try!(GetVarValue(capture, .())))..AddRef());
 		}
-		let vars = scopedVariables.PopBack();
-		for (let v in vars)
-		{
-			variables[v].Release();
-			variables.Remove(v);
-		}
-		delete vars;
+		let values = scopedValues.PopBack();
+		for (let val in values)
+			val.Release();
+		delete values;
+		for (let (key, value) in variables)
+			if (key.scop === scop)
+				value.Release();
 		if (scop.type case .Function)
-			delete stackTrace.PopBack().name;
-		scopes.PopBack();
+			delete stackTrace.PopFront().name;
+		scopes.PopFront();
 		return .Ok;
 	}
 
@@ -261,7 +289,7 @@ class Interpreter
 				{
 				case .Function(let definition, ?):
 					Runtime.Assert(definition case .Function(?, let captures, let capturesLocked));
-					if (capturesLocked) continue;
+					if (!*capturesLocked) continue;
 					for (let capture in captures)
 					{
 						if (capture.key == identifier)
@@ -289,7 +317,7 @@ class Interpreter
 				{
 				case .Function(let definition, ?):
 					Runtime.Assert(definition case .Function(let func, let captures, let capturesLocked));
-					if (capturesLocked) break loop; // locked captures can't be changed
+					if (*capturesLocked) break loop; // locked captures can't be changed
 					continue;
 				case .Block:
 					continue;
@@ -319,9 +347,8 @@ class Interpreter
 			return .Err;
 		}
 
-		Variable variable = .(scopes.Back, identifier);
+		Variable variable = .(scopes.Front, identifier);
 		variables.Add(variable, init);
-		scopedVariables.Back.Add(variable);
 		return .Ok;
 	}
 
@@ -330,9 +357,9 @@ class Interpreter
 	{
 		Try!(Assert(func case .Function(let funcExpr, ?, ?), invokation?.func.position ?? .(), $"Unable to invoke {func}"));
 		Try!(Assert(funcExpr.parameters.Length == args.Length, invokation?.rParen.position ?? .(), $"Expected {funcExpr.parameters.Length} arguments, got {args.Length}"));
-		Try!(ScopeIn(.Function(func, callee), invokation.position.Start));
+		Try!(ScopeIn(.Function(func, callee), invokation == null ? default : invokation.position.Start));
 		for (let i < args.Length)
-			DeclVar(funcExpr.parameters[i].identifier, args[i], default);
+			DeclVar(funcExpr.parameters[i].identifier, .CreateCopy(args[i]), default);
 		let result = Try!(Execute(funcExpr.body));
 		Try!(ScopeOut());
 		return result;
@@ -379,15 +406,16 @@ class Interpreter
 
 		if (let decl = node as LetStatement)
 		{
-			Try!(DeclVar(decl.varName.identifier, Try!(Evaluate(decl.value)), decl.varName.position));
+			Try!(DeclVar(decl.varName.identifier, Try!(Evaluate(decl.value))..AddRef(), decl.varName.position));
 			return default;
 		}
 
 		if (let reassign = node as ReassignStatement)
 		{
 			Runtime.Assert(variables.TryGetRef(Try!(GetVariable(reassign.varName.identifier, reassign.varName.position)), ?, let value));
-			value.Release();
-			*value = Try!(Evaluate(reassign.newValue));
+			let old = *value;
+			*value = Try!(Evaluate(reassign.newValue))..AddRef();
+			old.Release();
 			return default;
 		}
 
@@ -395,7 +423,7 @@ class Interpreter
 		{
 			if (returns.value == null)
 				return .Ok(.ReturnedVoid);
-			return .Ok(.ReturnedValue(Try!(Evaluate(returns.value))));
+			return .Ok(.ReturnedValue(Try!(Evaluate(returns.value))..AddRef()));
 		}
 
 		if (let conditional = node as IfStatement)
@@ -412,11 +440,20 @@ class Interpreter
 			return result;
 		}
 
+		if (let external = node as ExternalInvokation)
+			return Try!(external.lib.Call(external.id, this));
+
 		Runtime.FatalError();
 	}
 
 	public Result<MonkeyValue> Evaluate(ExpressionNode expr, bool allowVoid = false)
 	{
+		defer
+		{
+			if (@return case .Ok(let ok))
+				scopedValues.Back.Add(ok);
+		}
+
 		if (let literal = expr as IntLiteral)
 			return .Ok(literal.value);
 
@@ -428,8 +465,8 @@ class Interpreter
 
 		if (let func = expr as FunctionExpression)
 		{
-			MonkeyValue f = .Function(func, new:alloc .(), false);
-			scopes.Back.funcs.Add(f);
+			MonkeyValue f = .Function(func, new:alloc .(), new:alloc .());
+			scopes.Front.funcs.Add(f);
 			return .Ok(f);
 		}
 
@@ -457,9 +494,8 @@ class Interpreter
 			switch (Try!(Invoke(value, callee, invokation, params args)))
 			{
 			case .ReturnedValue(let val):
-				return val;
+				return .Ok(.CreateCopy(val));
 			default:
-				Try!(ScopeOut());
 				if (allowVoid)
 					return .Ok(default);
 				output.Fail("Function didn't return a value");
@@ -571,7 +607,7 @@ class Interpreter
 		{
 			MonkeyValue[] values = new .[array.values.Length];
 			for (let value in array.values)
-				values[@value.Index] = Try!(Evaluate(value));
+				values[@value.Index] = Try!(Evaluate(value))..AddRef();
 			return .Ok(values);
 		}
 
@@ -579,7 +615,7 @@ class Interpreter
 		{
 			Dictionary<MonkeyValue, MonkeyValue> output = new .((.)dict.keys.Length);
 			for (let i < dict.keys.Length)
-				Try!(Assert(output.TryAdd(Try!(Evaluate(dict.keys[i])), Try!(Evaluate(dict.values[i]))), dict.keys[i].position, "Duplicate key"));
+				Try!(Assert(output.TryAdd(Try!(Evaluate(dict.keys[i]))..AddRef(), Try!(Evaluate(dict.values[i]))..AddRef()), dict.keys[i].position, "Duplicate key"));
 			return .Ok(output);
 		}
 

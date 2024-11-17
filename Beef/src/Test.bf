@@ -104,9 +104,12 @@ static
 	static void TestInterpreter()
 	{
 		const let input = """
+			puts("hi");
+
 			let a = 0;
 			a = (a + 1) * 3; // 3
 			a = a + 2; // 5
+			assert(a == 5);
 			
 			let b = true;
 			let toggle = fn () {
@@ -118,7 +121,21 @@ static
 			};
 			toggle(); // false
 			b = toggle(); // false
+			assert(!b);
 
+			let array = [6, 9, [], '!'];
+			let result = "";
+			map(array, fn (item) {
+				result = result + item;
+			});
+			assert(result == "69[]!");
+
+			let make_greeting = fn (addressed) {
+				return fn () {
+					"Hello, " + addressed
+				};
+			};
+			assert(make_greeting("World")() == "Hello, World");
 			""";
 
 		Source source = scope .(
@@ -127,13 +144,13 @@ static
 			scope ConsoleErrors(),
 			scope BumpAllocator()
 		);
-
 		Parser parser = scope .(source);
-		Interpreter intr = scope .(parser);
-		intr.ScopeIn();
-		while (parser.NextStatement() case .Ok(let val))
-			intr.Execute(val);
+		Interpreter interp = scope .(parser);
+
+		interp.ScopeIn();
+		scope CoreLibrary().Init(interp);
+		interp.Execute(parser.ParseToEnd());
 		Debug.Break();
-		intr.ScopeOut();
+		interp.ScopeOut();
 	}
 }

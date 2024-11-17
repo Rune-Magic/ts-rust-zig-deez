@@ -7,7 +7,7 @@ namespace Monkey;
 class Parser
 {
 	protected Source source;
-	protected IRawAllocator alloc;
+	protected BumpAllocator alloc;
 	protected IErrorOutput output;
 
 	protected Queue<HashSet<StringView>> functionCaputres;
@@ -29,6 +29,20 @@ class Parser
 		Source = source;
 		functionCaputres = new:alloc .(4) { new:alloc .(2) };
 		nativeVars = new:alloc .(4) { new:alloc .(4) };
+	}
+
+	public Result<BlockNode> ParseToEnd()
+	{
+		List<StatementNode> statements = new:alloc .(32);
+		while (true)
+		{
+			let eof = Try!(source.ParseNext());
+			if (let token = eof as TokenNode && token.token == .EOF)
+				break;
+			source.Cycle(eof);
+			statements.Add(Try!(NextStatement()));
+		}
+		return new:alloc BlockNode(null, statements, null) { position = .(statements[0].position.Start, statements[^1].position.End), semicolon = null };
 	}
 
 	public Result<StatementNode> NextStatement()
@@ -279,6 +293,8 @@ class Parser
 			case .Function:
 				Try!(source.ExpectToken(.LParen));
 				List<IdentifierNode> parameters = new:alloc .();
+				functionCaputres.Add(new .(5));
+				nativeVars.Add(new .(5));
 				if (!Try!(source.NextTokenCase(.RParen, var rparen)))
 					loop: while (true)
 					{
@@ -290,6 +306,7 @@ class Parser
 								return .Err;
 							}
 						parameters.Add(identifier);
+						nativeVars.Back.Add(identifier.identifier);
 						rparen = Try!(source.NextToken());
 						switch (rparen.token)
 						{
@@ -301,8 +318,6 @@ class Parser
 						}
 					}
 				source.Cycle(Try!(source.ExpectToken(.LSquirly)));
-				functionCaputres.Add(new .(5));
-				nativeVars.Add(new .(5));
 				let block = Try!(NextStatement()) as BlockNode;
 				Debug.Assert(block != null);
 				let back = functionCaputres.PopBack(); defer delete back;

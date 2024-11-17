@@ -44,7 +44,7 @@ interface IErrorOutput
 	public void Warn(StringView msg, params Object[] formatArgs);
 }
 
-class Source : this(StreamReader stream, StringView origin, IErrorOutput output, IRawAllocator alloc)
+class Source : this(StreamReader stream, StringView origin, IErrorOutput output, BumpAllocator alloc)
 {
 	public SourceIndex index = .(0, 0, this);
 	protected Queue<AstNode> cycle = new .() ~ delete _;
